@@ -13,7 +13,7 @@ from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 
 
 training_set_path = Path("data")
-output_dir = 'trained_models/donut_ref50'
+output_dir = '/artifacts'
 processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base")
 
 
