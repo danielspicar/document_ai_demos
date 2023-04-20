@@ -7,3 +7,4 @@ torchaudio
 datasets
 huggingface_hub
 sentencepiece
+seqeval
