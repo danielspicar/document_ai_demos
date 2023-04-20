@@ -9,3 +9,4 @@ huggingface_hub
 sentencepiece
 seqeval
 tensorboard
+protobuf<3.21.0
