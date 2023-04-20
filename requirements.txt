@@ -1,0 +1,8 @@
+pillow
+transformers
+numpy
+torch
+torchvision
+torchaudio
+datasets
+huggingface_hub
