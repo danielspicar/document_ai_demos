@@ -3,18 +3,20 @@ from PIL import Image
 import json
 from pathlib import Path
 from transformers import DonutProcessor
-import numpy as np
+import re
 
 import torch
-from transformers import VisionEncoderDecoderModel
-from datasets import Dataset, load_metric
-from huggingface_hub import HfFolder
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
+from transformers import VisionEncoderDecoderModel, TrainingArguments, Trainer
+from datasets import Dataset
 
 
-training_set_path = Path("data")
-output_dir = '/artifacts'
+
+
+training_set_path = Path("receipts")
+output_dir = "training_checkpoints"
 processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base")
+model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base")
+
 
 
 images = []
@@ -124,99 +126,67 @@ processed_dataset = proc_dataset.map(transform_and_tokenize,remove_columns=["ima
 # Train test split
 final_dataset = processed_dataset.train_test_split(test_size=0.1)
 
-metric = load_metric("seqeval")
 
-return_entity_level_metrics = False
+# Resize embedding layer to match vocabulary size
+model.decoder.resize_token_embeddings(len(processor.tokenizer))
+# Adjust our image size and output sequence lengths
+model.config.encoder.image_size = processor.feature_extractor.size[::-1]  # (height, width)
+model.config.decoder.max_length = len(max(final_dataset['train']["labels"], key=len))
 
-
-def compute_metrics(p):
-    labels = p.label_ids
-    predictions = np.argmax(p.predictions, axis=2)
-
-    # Remove ignored index for special tokens (padding, subwords, etc.)
-    # -> https://huggingface.co/docs/transformers/tasks/token_classification)
-    true_predictions = [[classes[p] for (p, l) in zip(pred, lbl) if l != -100]
-                        for pred, lbl in zip(predictions, labels)]
-    true_labels = [[classes[l] for (p, l) in zip(pred, lbl) if l != -100]
-                   for pred, lbl in zip(predictions, labels)]
-
-    results = metric.compute(predictions=true_predictions, references=true_labels, zero_division='0')
-
-    if return_entity_level_metrics:
-        # Unpack nested dictionaries
-        final_results = {}
-        for key, value in results.items():
-            if isinstance(value, dict):
-                for n, v in value.items():
-                    final_results[f"{key}_{n}"] = v
-            else:
-                final_results[key] = value
-        return final_results
-    else:
-        return {
-            "precision": results["overall_precision"],
-            "recall": results["overall_recall"],
-            "f1": results["overall_f1"],
-            "accuracy": results["overall_accuracy"],
-        }
+# Add task token for decoder to start
+model.config.pad_token_id = processor.tokenizer.pad_token_id
+model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids(['<s>'])[0]
 
 
 
-def train(output):
-    model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base")
+def train(data, m):
 
-    # Adjust our image size and output sequence lengths
-    model.config.encoder.image_size = processor.feature_extractor.size[::-1] # (height, width)
-    model.config.decoder.max_length = len(max(final_dataset['train']["labels"], key=len))
+    NUM_TRAIN_EPOCHS = 20
+    LEARNING_RATE = 4e-5
+    os.environ["WANDB_DISABLED"] = 'true'
 
-    # Add task token for decoder to start
-    model.config.pad_token_id = processor.tokenizer.pad_token_id
-    model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids(['<s>'])[0]
+    for param in model.base_model.parameters():
+        if param.requires_grad:
+            param.requires_grad =True
 
-    # Arguments for training
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=output,
-        num_train_epochs=3,
-        learning_rate=3e-5,
-        per_device_train_batch_size=2,
-        weight_decay=0.01,
-        fp16=False,
-        logging_steps=100,
-        save_total_limit=2,
-        evaluation_strategy="no",
-        save_strategy="epoch",
-        predict_with_generate=True,
-        # push to hub parameters
-        report_to="tensorboard",
-        push_to_hub=False,
-        hub_strategy="every_save",
-        hub_model_id=output,
-        hub_token=HfFolder.get_token(),
-    )
 
-    # Create Trainer
-    trainer = Seq2SeqTrainer(
-        model=model,
+    training_args = TrainingArguments(output_dir=output_dir,
+                                      num_train_epochs=NUM_TRAIN_EPOCHS,
+                                      # max_steps=1500,
+                                      logging_strategy="epoch",
+                                      save_total_limit=1,
+                                      learning_rate=LEARNING_RATE,
+                                      evaluation_strategy="epoch",
+                                      save_strategy="epoch",
+                                      # eval_steps=100,
+                                      load_best_model_at_end=True,  ####### set to false; as untrained model might seem to perform best acc. to f1
+                                        )
+
+    # Initialize our Trainer
+    trainer = Trainer(
+        model=m,
         args=training_args,
-        train_dataset=final_dataset['train'],
+        train_dataset=data["train"],
+        eval_dataset=data["test"]
     )
-
     trainer.train()
-    trainer.save_model(output)
-    processor.save_pretrained(output)
 
-train(output_dir)
+    trainer.save_model(output_dir)
+    processor.save_pretrained(output_dir)
+
+train(final_dataset, model)
 
 
-processor = DonutProcessor.from_pretrained('trained_models/donut_ref50')
-model = VisionEncoderDecoderModel.from_pretrained('trained_models/donut_ref50')
+############################################################### EVAL ####################################################
+processor = DonutProcessor.from_pretrained(output_dir)
+model = VisionEncoderDecoderModel.from_pretrained(output_dir)
 
 # Move model to GPU
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model.to(device)
 
 # Load random document image from the test set
-test_sample = final_dataset["test"][0]
+test_sample = final_dataset["train"][1]
 def run_prediction(sample, model=model, processor=processor):
     # prepare inputs
     pixel_values = torch.tensor(sample["pixel_values"]).unsqueeze(0)
@@ -239,6 +209,8 @@ def run_prediction(sample, model=model, processor=processor):
 
     # process output
     prediction = processor.batch_decode(outputs.sequences)[0]
+    prediction = prediction.replace(processor.tokenizer.eos_token, "").replace(processor.tokenizer.pad_token, "")
+    prediction = re.sub(r"<.*?>", "", prediction, count=1).strip()  # remove first task start token
     prediction = processor.token2json(prediction)
 
     # load reference target

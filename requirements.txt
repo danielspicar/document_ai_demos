@@ -1,12 +1,8 @@
 pillow
 transformers
-numpy
 torch
 torchvision
 torchaudio
 datasets
-huggingface_hub
-sentencepiece
-seqeval
 tensorboard
 protobuf<3.21.0
